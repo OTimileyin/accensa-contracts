@@ -1,13 +1,13 @@
 //! Flash loan tests (issue #442).
 
 use super::*;
-use crate::flash_loan::{flash_loan_fee, FLASH_LOAN_FEE_BPS};
+use crate::flash_loan::{flash_loan_fee, FlashLoanEvent, FLASH_LOAN_FEE_BPS};
 use crate::test_helpers::vault_init;
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    testutils::Address as _,
+    testutils::{Address as _, Events as _},
     token::{StellarAssetClient, TokenClient},
-    Address, Bytes, Env,
+    Address, Bytes, Env, Event,
 };
 
 const FLOAT: i128 = 1_000_000;
@@ -33,6 +33,11 @@ pub enum Mode {
 enum ReceiverKey {
     Vault,
     Mode,
+    /// Principal the vault announced in `on_flash_loan`, recorded so a test can
+    /// cross-check the event against what the callee was actually handed.
+    ObservedAmount,
+    /// Premium the vault announced in `on_flash_loan`.
+    ObservedFee,
 }
 
 #[contract]
@@ -45,6 +50,22 @@ impl MockReceiver {
         env.storage().instance().set(&ReceiverKey::Mode, &mode);
     }
 
+    /// Principal the vault handed over in the last `on_flash_loan` call.
+    pub fn observed_amount(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&ReceiverKey::ObservedAmount)
+            .unwrap_or(0)
+    }
+
+    /// Premium the vault announced in the last `on_flash_loan` call.
+    pub fn observed_fee(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&ReceiverKey::ObservedFee)
+            .unwrap_or(0)
+    }
+
     pub fn on_flash_loan(
         env: Env,
         _initiator: Address,
@@ -53,6 +74,12 @@ impl MockReceiver {
         fee: i128,
         _data: Bytes,
     ) {
+        env.storage()
+            .instance()
+            .set(&ReceiverKey::ObservedAmount, &amount);
+        env.storage()
+            .instance()
+            .set(&ReceiverKey::ObservedFee, &fee);
         let vault: Address = env.storage().instance().get(&ReceiverKey::Vault).unwrap();
         let mode: Mode = env.storage().instance().get(&ReceiverKey::Mode).unwrap();
         let token = TokenClient::new(&env, &token);
@@ -159,6 +186,43 @@ fn lock_is_released_after_loan() {
     s.client.flash_loan(&s.receiver, &1_000, &data(&s.env));
 }
 
+#[test]
+fn repaid_loan_event_shape_matches_moved_amounts() {
+    let s = setup(Mode::Repay);
+    let treasury = Address::generate(&s.env);
+    s.client.set_fee_recipient(&treasury);
+
+    let vault_before = s.token.balance(&s.vault);
+    let receiver_before = s.token.balance(&s.receiver);
+    let treasury_before = s.token.balance(&treasury);
+
+    let amount = 500_000;
+    let fee = s.client.flash_loan(&s.receiver, &amount, &data(&s.env));
+
+    // Exact topic tuple plus payload, in the XDR form the indexer reads. Read
+    // the events first: `events().all()` only holds the last invocation.
+    let events = s.env.events().all().filter_by_contract(&s.vault);
+    assert_eq!(events.events().len(), 1);
+    let expected = FlashLoanEvent {
+        receiver: s.receiver.clone(),
+        amount,
+        fee,
+        treasury: treasury.clone(),
+    };
+    assert_eq!(&events.events()[0], &expected.to_xdr(&s.env, &s.vault));
+
+    // The recorded fee is the premium actually moved this invocation: the
+    // receiver was handed it, the treasury gained it and the receiver paid it.
+    let observed_amount = MockReceiverClient::new(&s.env, &s.receiver).observed_amount();
+    let observed_fee = MockReceiverClient::new(&s.env, &s.receiver).observed_fee();
+    assert_eq!(observed_amount, amount);
+    assert_eq!(observed_fee, fee);
+    assert_eq!(s.token.balance(&treasury) - treasury_before, fee);
+    assert_eq!(receiver_before - s.token.balance(&s.receiver), fee);
+    // Principal plus premium came back, so the float is whole again.
+    assert_eq!(s.token.balance(&s.vault), vault_before);
+}
+
 // ── Forced reverts ─────────────────────────────────────────────────────────
 
 #[test]
@@ -184,6 +248,32 @@ fn principal_without_fee_reverts() {
     );
     assert_eq!(s.token.balance(&s.vault), FLOAT);
     assert_eq!(s.token.balance(&s.receiver), RECEIVER_FUNDS);
+}
+
+#[test]
+fn no_flash_loan_event_when_repayment_is_skipped() {
+    let s = setup(Mode::Default);
+    assert_eq!(
+        s.client
+            .try_flash_loan(&s.receiver, &500_000, &data(&s.env)),
+        Err(Ok(Error::InsufficientFloat))
+    );
+    // The reverted invocation announced nothing: no fee was recorded in the
+    // event because none was ever chargeable.
+    let events = s.env.events().all().filter_by_contract(&s.vault);
+    assert_eq!(events.events().len(), 0);
+}
+
+#[test]
+fn no_flash_loan_event_when_fee_is_short() {
+    let s = setup(Mode::RepayPrincipal);
+    assert_eq!(
+        s.client
+            .try_flash_loan(&s.receiver, &500_000, &data(&s.env)),
+        Err(Ok(Error::InsufficientFloat))
+    );
+    let events = s.env.events().all().filter_by_contract(&s.vault);
+    assert_eq!(events.events().len(), 0);
 }
 
 #[test]
