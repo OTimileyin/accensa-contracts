@@ -1,8 +1,8 @@
 #![no_std]
 
 use accensa_common::{
-    storage::extend_instance_ttl, Error, PolicyContext, RefundPolicyClient, TimePolicyParams,
-    VaultInit, VdfPolicyParams,
+    math::add_amounts, storage::extend_instance_ttl, Error, PolicyContext, RefundPolicyClient,
+    TimePolicyParams, VaultInit, VdfPolicyParams,
 };
 use soroban_sdk::{
     contract, contractevent, contractimpl, contractmeta, contracttype, token, xdr::ToXdr, Address,
@@ -2341,7 +2341,11 @@ impl RefundVault {
             return Err(Error::StrategyNotApproved);
         }
 
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(Error::NotInitialized)?;
         let token_client = token::Client::new(&env, &token_addr);
         let token_balance = token_client.balance(&env.current_contract_address());
 
@@ -2496,9 +2500,10 @@ impl RefundVault {
             .persistent()
             .get(&DataKey::HarvestedYield)
             .unwrap_or(0);
+        let total_harvested = add_amounts(harvested, yield_amount)?;
         env.storage()
             .persistent()
-            .set(&DataKey::HarvestedYield, &(harvested + yield_amount));
+            .set(&DataKey::HarvestedYield, &total_harvested);
         persist_yield_ttl(&env, &DataKey::HarvestedYield);
 
         let nonce = increment_nonce(&env);
@@ -2656,7 +2661,7 @@ impl RefundVault {
             .storage()
             .instance()
             .get(&DataKey::RefundWindow)
-            .unwrap();
+            .ok_or(Error::NotInitialized)?;
 
         let extend_to = refund_record_ttl_extend_to(&env, window, record.paid_at_ledger);
         // Threshold == extend_to: a caller invoking this well before expiry
@@ -2742,12 +2747,22 @@ impl RefundVault {
     }
 }
 
+/// Typed failure for the missing `DataKey::Token` in `deploy_to_yield` (issue #685).
+#[cfg(test)]
+mod deploy_to_yield_token_tests;
 #[cfg(test)]
 mod dust_tests;
+/// Typed failure for the missing `DataKey::RefundWindow` in `extend_refund_ttl`
+/// (issue #686).
+#[cfg(test)]
+mod extend_refund_ttl_window_tests;
 #[cfg(test)]
 mod flash_loan_tests;
 #[cfg(test)]
 mod fuzz_test;
+/// Boundary test for `harvest_yield`'s checked running total (issue #720).
+#[cfg(test)]
+mod harvest_yield_overflow_tests;
 #[cfg(test)]
 mod oracle_tests;
 #[cfg(test)]
