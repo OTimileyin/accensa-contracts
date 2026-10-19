@@ -8,12 +8,6 @@ breaking changes bump the **minor** version, and they are called out as such.
 
 ## [Unreleased]
 
-- **`refund-vault` (issue #638): assert the flash-loan event shape and its recorded fee.**
-  `contracts/refund-vault/src/flash_loan_tests.rs` now asserts `FlashLoanEvent`'s
-  exact topic tuple and payload via the crate's XDR comparison idiom,
-  cross-checks the event's amount and fee against the values the receiver was
-  handed and the token balances moved in the same call, and shows both revert
-  paths leave no flash-loan event behind.
 - **`refund-vault` (issue #685): report a missing payment token from
   `deploy_to_yield` instead of aborting.** The `DataKey::Token` read in
   `contracts/refund-vault/src/lib.rs` was an `unwrap()`, so a deployment that
